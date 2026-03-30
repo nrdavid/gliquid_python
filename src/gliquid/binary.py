@@ -576,7 +576,7 @@ class BinaryLiquid:
                 else:
                     mpds_phases_strs[min(int(phase['comp']*100), len(_x_vals) - 1)] = "|"
             for phase in self.phases:
-                if phase['name'] not in ['L'] + self.components:
+                if not phase['is_solution'] and phase not in self.components:
                     mp_phases_strs[min(int(phase['comp']*100), len(_x_vals) - 1)] = "|"
             print("\n--- Low temperature phase mismatch ---")
             print("MPDS:", "[" + "".join(mpds_phases_strs) + "]")
@@ -974,8 +974,8 @@ class BinaryLiquid:
         Returns:
             float: Multiplicative penalty factor >= 1.0.
         """
-        if self._param_format == 'linear':
-            return 1.0
+        # if self._param_format == 'linear':
+        #     return 1.0
 
         if not penalty_cfg:
             return 1.0
@@ -1165,10 +1165,10 @@ class BinaryLiquid:
         self.solve_params_from_constraints(guess_dict) 
 
         # Check if the parameters are physically valid
-        if self._param_format == 'linear' and kwargs.get('check_lupis_elliott', True) and not self.obeys_lupis_elliott():
-            if verbose:
-                print(f'Lupis-Elliott sign constraint violated for params {self.get_params()}')
-            return float('inf')
+        # if self._param_format == 'linear' and kwargs.get('check_lupis_elliott', True) and not self.obeys_lupis_elliott():
+        #     if verbose:
+        #         print(f'Lupis-Elliott sign constraint violated for params {self.get_params()}')
+        #     return float('inf')
         
         if kwargs.get('check_h0_below_ch', True) and self.h0_below_ch():
             if verbose:
@@ -1190,7 +1190,7 @@ class BinaryLiquid:
         
         # Evaluate the liquidus temperature deviation metrics
         f_val, _, _, _ = self.calculate_deviation_metrics(**kwargs)
-        if self._param_format in ['comb-exp', 'combined'] and kwargs.get('check_lupis_elliott', True):
+        if self._param_format in ['comb-exp', 'combined', 'linear'] and kwargs.get('check_lupis_elliott', True):
             f_val = f_val * self.lupis_elliott_factor()
         obj_mae, obj_rmse, _, _ = self.calculate_deviation_metrics(**kwargs)
         f_val = obj_mae * self.lupis_elliott_factor() if kwargs.get('check_lupis_elliott', True) else obj_mae
@@ -1364,7 +1364,9 @@ class BinaryLiquid:
             return []
         
         def find_nearest_phase(composition, tol=0.02):
-            sorted_phases = sorted(self.phases[:-1], key=lambda x: abs(x['comp'] - composition))
+            sorted_phases = sorted([p for p in self.phases if 'comp' in p], key=lambda x: abs(x['comp'] - composition))
+            if not sorted_phases:
+                return {}, float('inf')
             nearest = sorted_phases[0]
             deviation = abs(nearest['comp'] - composition)
             if deviation > tol:
@@ -1852,6 +1854,7 @@ class BLPlotter:
             kwargs: Additional keyword arguments passed to `get_plot`.
         """
         fig = self.get_plot(plot_type, **kwargs)
+        image_format = stream.name.split('.')[-1] if isinstance(stream, StringIO) and stream.name else image_format
         
         if isinstance(fig, go.Figure):
             if plot_type in ['ch', 'ch+g', 'vch']:
