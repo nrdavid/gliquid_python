@@ -10,11 +10,14 @@ ORCID: https://orcid.org/0009-0004-6334-9426
 from __future__ import annotations
 
 import copy
+import json
 import math
+import subprocess
+import sys
+import tempfile
 import time
 import numbers
 import os
-import pickle
 import numpy as np
 import pandas as pd
 import sympy as sp
@@ -25,7 +28,7 @@ from matplotlib.colors import LogNorm
 from matplotlib.ticker import ScalarFormatter
 import plotly.graph_objects as go
 from itertools import combinations
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pymatgen.core import Composition
 from pymatgen.analysis.phase_diagram import PDPlotter, PhaseDiagram, PDEntry  # The PMG PDPlotter source code is modified here
@@ -918,35 +921,66 @@ class BinaryLiquid:
         return ((h_l0 <= tol and s_l0 <= tol) or (h_l0 >= -tol and s_l0 >= -tol)) and \
                 ((h_l1 <= tol and s_l1 <= tol) or (h_l1 >= -tol and s_l1 >= -tol))
     
-    def lupis_elliott_factor(self, verbose=False) -> float: 
+    def lupis_elliott_factor(self, penalty_cfg: dict | None = None) -> float:
         """
         Assigns a factor which scales with degree of violation for Lupis-Elliott sign constraints.
+
+        Active penalty term for each violating component uses:
+            P = 1 + A * sqrt(d) * [2*|x*y| / (|x| + |y|)^2] * (|x| + |y|)
+        where d = x^2 + y^2, A is 'strength', x is enthalpy, and y is entropy
+        after entropy scaling (y = s * hs_ratio).
+
+        Args:
+            penalty_cfg (dict | None): Optional Lupis-Elliott penalty configuration.
+                Supports shared defaults and optional per-term overrides:
+                - Shared keys: 'strength', 'hs_ratio'
+                - Per-term keys: 'l0', 'l1' each containing {'strength'}
+                - Backward compatibility: 'scale' is accepted as an alias for 'strength'
 
         Returns:
             float: A penalty factor greater than 1.0 if the parameters violate the Lupis-Elliott sign constraints,
                    otherwise returns 1.0.
         """
-        def calculate_penalty(x, y, p_name='', power=1.5, scale=1E-8):
+        penalty_cfg = penalty_cfg or {}
+        global_strength = float(penalty_cfg.get('strength', penalty_cfg.get('scale', 1E-8)))
+        entropy_scale = float(penalty_cfg.get('hs_ratio', hs_ratio))
+
+        def resolve_term_cfg(term: str) -> float:
+            term_cfg = penalty_cfg.get(term, {})
+            if not isinstance(term_cfg, dict):
+                term_cfg = {}
+            return float(term_cfg.get('strength', term_cfg.get('scale', global_strength)))
+
+        def calculate_penalty(x, y, strength=0.005):
+            if strength <= 0:
+                return 0.0
             # x*y < 0 is a quick way to check for opposite signs
             if x * y < 0:
-                # Calculate Euclidean distance from the origin
-                distance = np.sqrt(x**2 + y**2)
-                factor = 1 + (distance ** power) * scale
-                if verbose:
-                    print(f"Lupis-Elliott violation detected for parameter {p_name}: h={x:.3g}, s={y/hs_ratio:.3g}, d={distance:.3g}, factor={factor:.5g}")
-                return factor
-            return 1.0
+                abs_sum = abs(x) + abs(y)
+                if abs_sum <= 1e-16:
+                    return 0.0
+                d = x**2 + y**2
+                if d <= 0:
+                    return 0.0
+                alignment_factor = (2.0 * abs(x * y)) / (abs_sum ** 2)
+                return float(strength * np.sqrt(d) * alignment_factor * abs_sum)
+            return 0.0
+
+        l0_strength = resolve_term_cfg('l0')
+        l1_strength = resolve_term_cfg('l1')
     
         if self._param_format == 'comb-exp':
-            lambda_args_vals = [self.min_liq_temp, self.get_L0_a(), self.get_L0_b()] 
+            lambda_args_vals = [0, self.get_L0_a(), self.get_L0_b()] 
             h_l0 = self.eqs['h_l0_lambdified'](*lambda_args_vals)
             s_l0 = self.eqs['s_l0_lambdified'](*lambda_args_vals)
-            return float(calculate_penalty(h_l0, s_l0*hs_ratio, 'L0'))
-        elif self._param_format == 'combined':
-            largv0, largv1 = [self.min_liq_temp, self.get_L0_a(), self.get_L0_b()], [0, self.get_L1_a(), self.get_L1_b()]
+            return float(1.0 + calculate_penalty(h_l0 / entropy_scale, s_l0, l0_strength))
+        elif self._param_format in ['combined', 'linear']:
+            largv0, largv1 = [0, self.get_L0_a(), self.get_L0_b()], [0, self.get_L1_a(), self.get_L1_b()]
             h_l0, s_l0 = self.eqs['h_l0_lambdified'](*largv0), self.eqs['s_l0_lambdified'](*largv0)
             h_l1, s_l1 = self.eqs['h_l1_lambdified'](*largv1), self.eqs['s_l1_lambdified'](*largv1)
-            return float((calculate_penalty(h_l0, s_l0*hs_ratio, 'L0') + calculate_penalty(h_l1, s_l1*hs_ratio, 'L1'))/2.0)
+            return float(1.0 +
+                         calculate_penalty(h_l0 / entropy_scale, s_l0, l0_strength) +
+                         calculate_penalty(h_l1 / entropy_scale, s_l1, l1_strength))
         return 1.0
 
 
@@ -979,6 +1013,7 @@ class BinaryLiquid:
 
         if not penalty_cfg:
             return 1.0
+
 
         def _term(x_val: float, cfg: dict | None) -> float:
             if not cfg:
@@ -1163,12 +1198,6 @@ class BinaryLiquid:
         # Solve for non-guessed parameter values from constraints
         guess_dict = {symbol: guess for symbol, guess in zip(self.guess_symbols, guess)}            
         self.solve_params_from_constraints(guess_dict) 
-
-        # Check if the parameters are physically valid
-        # if self._param_format == 'linear' and kwargs.get('check_lupis_elliott', True) and not self.obeys_lupis_elliott():
-        #     if verbose:
-        #         print(f'Lupis-Elliott sign constraint violated for params {self.get_params()}')
-        #     return float('inf')
         
         if kwargs.get('check_h0_below_ch', True) and self.h0_below_ch():
             if verbose:
@@ -1191,9 +1220,7 @@ class BinaryLiquid:
         # Evaluate the liquidus temperature deviation metrics
         f_val, _, _, _ = self.calculate_deviation_metrics(**kwargs)
         if self._param_format in ['comb-exp', 'combined', 'linear'] and kwargs.get('check_lupis_elliott', True):
-            f_val = f_val * self.lupis_elliott_factor()
-        obj_mae, obj_rmse, _, _ = self.calculate_deviation_metrics(**kwargs)
-        f_val = obj_mae * self.lupis_elliott_factor() if kwargs.get('check_lupis_elliott', True) else obj_mae
+            f_val = f_val * self.lupis_elliott_factor(kwargs.get('lupis_elliott_cfg'))
 
         # Apply tau-line penalty using distribution priors on L0_b/L1_b.
         if kwargs.get('use_tau_penalty', False):
@@ -1339,6 +1366,12 @@ class BinaryLiquid:
                 - check_full_ss (bool): If True, checks if the full solid solution is present in the system.
                 - check_phase_mismatch (bool): If True, checks phase mismatch between invariant points and self.phases.
                 - check_lupis_elliott (bool): If True, checks Lupis-Elliott sign constraints.
+                - lupis_elliott_cfg (dict): Optional Lupis-Elliott penalty config.
+                    Supported keys:
+                        * 'strength' (float): global default penalty strength.
+                        * 'hs_ratio' (float): entropy scaling factor.
+                        * 'l0' (dict): optional per-term override with {'strength'}.
+                        * 'l1' (dict): optional per-term override with {'strength'}.
                 - check_h0_below_ch (bool): If True, checks if the liquid enthalpy at T=0K is below the solid convex hull.
                 - check_liquidus_continuity (bool): If True, checks if the generated liquidus is continuous.
                 - params_init (list): Initial parameter guesses for the Nelder-Mead algorithm.
@@ -1350,10 +1383,20 @@ class BinaryLiquid:
                         * 'l0': {'weight', 'median', 'mad', 'exponent'}
                         * 'l1': {'weight', 'median', 'mad', 'exponent'}
                         * 'apply_l1' (bool): force-enable/disable L1 term.
-                - use_process_pool (bool): If True, run multi-attempt optimization with ProcessPoolExecutor
-                    instead of ThreadPoolExecutor. Default is False.
-                - process_pool_workers (int | None): Number of process workers when use_process_pool=True.
-                    Default is half of available CPU cores.
+                - parallel_backend (str): Parallel backend for multi-attempt optimization.
+                    Supported values: 'thread' (default), 'dask'.
+                - dask_client (Any | None): Optional existing dask.distributed.Client.
+                    If provided, this method reuses the client and does not close it.
+                - dask_n_workers (int | None): Number of local Dask workers when creating
+                    an internal LocalCluster. Defaults to half of available CPU cores.
+                - dask_threads_per_worker (int): Threads per worker for internal LocalCluster.
+                    Defaults to 1.
+                - dask_processes (bool): Whether internal LocalCluster workers use processes.
+                    Defaults to True.
+                - dask_dashboard_address (str | None): Dashboard bind address for internal
+                    LocalCluster. Defaults to None.
+                - dask_silence_logs (str | int | None): Logging level forwarded to
+                    LocalCluster(silence_logs=...).
 
         Returns:
             list[dict]: Parameter fitting data containing results of all optimization attempts.
@@ -1633,21 +1676,22 @@ class BinaryLiquid:
         self.guess_symbols = [b_sym, d_sym] if self._param_format not in one_constr_methods else [b_sym, c_sym]
         solve_symbols = [sym for sym in [a_sym, b_sym, c_sym, d_sym] if sym not in self.guess_symbols]
         fitting_data = []
-        use_process_pool = bool(kwargs.get('use_process_pool', False))
-        process_pool_workers = kwargs.get('process_pool_workers', None)
+        parallel_backend = str(kwargs.get('parallel_backend', 'thread')).strip().lower()
+        if parallel_backend not in ['thread', 'dask']:
+            print(f"Warning: unsupported parallel_backend={parallel_backend!r}; using 'thread'.")
+            parallel_backend = 'thread'
+
+        dask_client = kwargs.get('dask_client', None)
+        dask_n_workers = kwargs.get('dask_n_workers', None)
+        dask_threads_per_worker = kwargs.get('dask_threads_per_worker', 1)
+        dask_processes = bool(kwargs.get('dask_processes', True))
+        dask_dashboard_address = kwargs.get('dask_dashboard_address', None)
+        dask_silence_logs = kwargs.get('dask_silence_logs', None)
 
         # Prepare optimization tasks (up to n_opts, limited by available ICs)
         optimization_tasks = []
         for i in range(min(n_opts, len(nelder_mead_ics))):
             optimization_tasks.append((i, nelder_mead_ics[i]))
-
-        if use_process_pool:
-            import __main__
-            if getattr(__main__, '__file__', None) is None:
-                raise RuntimeError(
-                    "ProcessPoolExecutor requires running from a script file. "
-                    "Protect your entry point with: if __name__ == '__main__':"
-                )
 
         if len(optimization_tasks) == 1:
             # Single optimization: run directly without executor overhead
@@ -1658,44 +1702,76 @@ class BinaryLiquid:
             if result is not None:
                 fitting_data.append(result)
         elif optimization_tasks:
-            if use_process_pool:
-                default_workers = max(1, (os.cpu_count() or 1) // 2)
-                requested_workers = process_pool_workers if isinstance(process_pool_workers, int) and process_pool_workers > 0 else default_workers
-                max_workers = min(len(optimization_tasks), requested_workers)
-
-                # Validate picklability up front for Windows spawn mode.
-                test_payload = (
-                    optimization_tasks[0][0], optimization_tasks[0][1], self, kwargs,
-                    verbose, one_constr_methods, solve_symbols, mean_liq_temp
-                )
+            if parallel_backend == 'dask':
                 try:
-                    pickle.dumps(test_payload)
-                except Exception as e:
-                    raise RuntimeError(
-                        "Process-pool payload is not picklable. "
-                        "Use use_process_pool=False or remove non-picklable kwargs."
-                    ) from e
-                executor_cls = ProcessPoolExecutor
+                    from dask.distributed import Client as DaskClient, LocalCluster, as_completed as dask_as_completed
+                except Exception:
+                    print("Warning: parallel_backend='dask' requested but dask.distributed is unavailable. Falling back to 'thread'.")
+                    parallel_backend = 'thread'
+
+            if parallel_backend == 'dask':
+                owns_client = dask_client is None
+                client = dask_client
+                cluster = None
+
+                if client is None:
+                    default_workers = max(1, (os.cpu_count() or 1) // 2)
+                    requested_workers = dask_n_workers if isinstance(dask_n_workers, int) and dask_n_workers > 0 else default_workers
+                    n_workers = min(len(optimization_tasks), requested_workers)
+                    threads_per_worker = dask_threads_per_worker if isinstance(dask_threads_per_worker, int) and dask_threads_per_worker > 0 else 1
+
+                    cluster_kwargs = {
+                        'n_workers': n_workers,
+                        'threads_per_worker': threads_per_worker,
+                        'processes': dask_processes,
+                        'dashboard_address': dask_dashboard_address,
+                    }
+                    if dask_silence_logs is not None:
+                        cluster_kwargs['silence_logs'] = dask_silence_logs
+
+                    cluster = LocalCluster(**cluster_kwargs)
+                    client = DaskClient(cluster)
+
+                try:
+                    futures = {
+                        client.submit(
+                            _run_single_optimization_worker,
+                            task_idx, task_ics, self, kwargs, verbose,
+                            one_constr_methods, solve_symbols, mean_liq_temp,
+                            pure=False): task_idx
+                        for task_idx, task_ics in optimization_tasks
+                    }
+                    for future in dask_as_completed(futures):
+                        task_idx = futures[future]
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                fitting_data.append(result)
+                        except Exception as e:
+                            print(f"Optimization attempt #{task_idx + 1} failed with exception: {e}")
+                finally:
+                    if owns_client and client is not None:
+                        client.close()
+                    if owns_client and cluster is not None:
+                        cluster.close()
             else:
                 max_workers = min(len(optimization_tasks), n_opts)
-                executor_cls = ThreadPoolExecutor
-
-            with executor_cls(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _run_single_optimization_worker,
-                        task_idx, task_ics, self, kwargs, verbose,
-                        one_constr_methods, solve_symbols, mean_liq_temp): task_idx
-                    for task_idx, task_ics in optimization_tasks
-                }
-                for future in as_completed(futures):
-                    task_idx = futures[future]
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            fitting_data.append(result)
-                    except Exception as e:
-                        print(f"Optimization attempt #{task_idx + 1} failed with exception: {e}")
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _run_single_optimization_worker,
+                            task_idx, task_ics, self, kwargs, verbose,
+                            one_constr_methods, solve_symbols, mean_liq_temp): task_idx
+                        for task_idx, task_ics in optimization_tasks
+                    }
+                    for future in as_completed(futures):
+                        task_idx = futures[future]
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                fitting_data.append(result)
+                        except Exception as e:
+                            print(f"Optimization attempt #{task_idx + 1} failed with exception: {e}")
 
         if fitting_data:
             best_fit = min(fitting_data, key=lambda x: x['f'])
@@ -1708,7 +1784,7 @@ class BinaryLiquid:
 def _run_single_optimization_worker(task_index, selected_ics, bl_template, run_kwargs_base,
                                     verbose, one_constr_methods, solve_symbols, mean_liq_temp):
     """
-    Module-level worker for thread/process executor compatibility on Windows spawn.
+    Module-level worker for thread/Dask backend compatibility.
 
     Args:
         task_index (int): Index of the optimization attempt.
@@ -1733,6 +1809,7 @@ def _run_single_optimization_worker(task_index, selected_ics, bl_template, run_k
     run_kwargs['use_param_penalty'] = selected_ics.get('use_param_penalty', False)
     run_kwargs['use_tau_penalty'] = selected_ics.get('use_tau_penalty', False)
     run_kwargs['tau_penalty_cfg'] = copy.deepcopy(selected_ics.get('tau_penalty_cfg', run_kwargs_base.get('tau_penalty_cfg')))
+    run_kwargs['lupis_elliott_cfg'] = copy.deepcopy(selected_ics.get('lupis_elliott_cfg', run_kwargs_base.get('lupis_elliott_cfg')))
 
     if verbose:
         print(f"--- Nelder-Mead ICs Attempt #{task_index + 1} (initial f = {round(selected_ics['f'], 2)}) ---")
@@ -1843,7 +1920,59 @@ class BLPlotter:
         elif isinstance(fig, plt.Figure):
             fig.figure.show()
 
-    def write_image(self, plot_type: str, stream: str | StringIO, image_format: str = "svg", **kwargs) -> None:
+    @staticmethod
+    def _resolve_stream_path(stream: str | StringIO) -> str:
+        if isinstance(stream, str):
+            return stream
+        if hasattr(stream, "name") and stream.name:
+            return str(stream.name)
+        raise TypeError("Plotly image export requires a file path or a named stream.")
+
+    @staticmethod
+    def _write_plotly_image_with_timeout(fig: go.Figure, stream: str | StringIO, timeout_s: float, **write_kwargs) -> None:
+        if timeout_s is None or timeout_s <= 0:
+            fig.write_image(stream, **write_kwargs)
+            return
+
+        stream_path = BLPlotter._resolve_stream_path(stream)
+        with tempfile.TemporaryDirectory(prefix="gliquid_plotly_export_") as temp_dir:
+            figure_payload_path = os.path.join(temp_dir, "figure_payload.json")
+            kwargs_payload_path = os.path.join(temp_dir, "write_kwargs.json")
+
+            with open(figure_payload_path, "w", encoding="utf-8") as payload_file:
+                payload_file.write(fig.to_json())
+            with open(kwargs_payload_path, "w", encoding="utf-8") as kwargs_file:
+                json.dump(write_kwargs, kwargs_file)
+
+            child_code = (
+                "import json\n"
+                "import pathlib\n"
+                "import plotly.io as pio\n"
+                "import sys\n"
+                "figure_json = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')\n"
+                "write_kwargs = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))\n"
+                "figure = pio.from_json(figure_json)\n"
+                "figure.write_image(sys.argv[2], **write_kwargs)\n"
+            )
+
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", child_code, figure_payload_path, stream_path, kwargs_payload_path],
+                    timeout=timeout_s,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f"Plotly image export timed out after {timeout_s:.1f}s") from exc
+
+            if completed.returncode != 0:
+                stderr_text = (completed.stderr or "").strip()
+                stdout_text = (completed.stdout or "").strip()
+                details = stderr_text or stdout_text or "unknown subprocess error"
+                raise RuntimeError(f"Plotly subprocess export failed: {details}")
+
+    def write_image(self, plot_type: str, stream: str | StringIO, image_format: str = "svg", export_timeout_s: float = 120.0, **kwargs) -> None:
         """
         Saves the generated plot as an image.
 
@@ -1851,16 +1980,28 @@ class BLPlotter:
             plot_type (str): The type of plot to save.
             stream (str | StringIO): The file path or stream to save the image.
             image_format (str): The format of the image (default is 'svg').
+            export_timeout_s (float): Maximum time allowed for Plotly image export.
             kwargs: Additional keyword arguments passed to `get_plot`.
         """
         fig = self.get_plot(plot_type, **kwargs)
         image_format = stream.name.split('.')[-1] if isinstance(stream, StringIO) and stream.name else image_format
         
         if isinstance(fig, go.Figure):
+            write_kwargs = {"format": image_format}
             if plot_type in ['ch', 'ch+g', 'vch']:
-                fig.write_image(stream, format=image_format, width=480 * 1.8, height=300 * 1.7) # 960, 700?
-            else:
-                fig.write_image(stream, format=image_format)
+                write_kwargs.update({"width": 480 * 1.8, "height": 300 * 1.7})  # 960, 700?
+
+            try:
+                self._write_plotly_image_with_timeout(
+                    fig,
+                    stream,
+                    timeout_s=export_timeout_s,
+                    **write_kwargs,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to export plot '{plot_type}' to '{stream}' with timeout={export_timeout_s:.1f}s: {exc}"
+                ) from exc
         elif isinstance(fig, plt.Figure):
             fig.figure.savefig(stream, format=image_format)
             plt.close(fig)
@@ -2128,6 +2269,10 @@ class BLPlotter:
         plot_a_params = kwargs.get('plot_a_params', False)
         fig, ax = plt.subplots(figsize=(8, 5))
         num_iters = self._bl.nmpath.shape[2]
+        total_iters_for_scale = int(kwargs.get('nmp_total_iters', num_iters))
+        if total_iters_for_scale < 1:
+            total_iters_for_scale = num_iters if num_iters > 0 else 1
+        total_iters_for_scale = max(total_iters_for_scale, num_iters)
 
         # Determine the range of temperature deviations (tdev_range)
         tdev_range = [None, None]
@@ -2139,15 +2284,30 @@ class BLPlotter:
             else: # L0_b, L1_b parameters
                 path_i = self._bl.nmpath[:, [1, 3, -1], i]
 
-            t_devs = [num for num in path_i[:, -1:] if num != float('inf')]
+            t_devs = [float(num) for num in path_i[:, -1] if num != float('inf')]
             if t_devs:
                 tdev_range[0] = min(t_devs) if tdev_range[0] is None else min(tdev_range[0], min(t_devs))
                 tdev_range[1] = max(t_devs) if tdev_range[1] is None else max(tdev_range[1], max(t_devs))
 
+        override_obj_range = kwargs.get('objective_range', None)
+        if override_obj_range is not None:
+            if not (isinstance(override_obj_range, (list, tuple)) and len(override_obj_range) == 2):
+                raise ValueError("kwarg 'objective_range' must be a 2-item tuple/list: (min_obj, max_obj)")
+            tdev_range = [float(override_obj_range[0]), float(override_obj_range[1])]
+
+        if tdev_range[0] is None or tdev_range[1] is None:
+            tdev_range = [0.0, 1.0]
+        elif tdev_range[0] == tdev_range[1]:
+            eps = max(1e-9, abs(tdev_range[0]) * 1e-6)
+            tdev_range = [tdev_range[0] - eps, tdev_range[1] + eps]
+
         # Triangle color mapping (iteration-based)
-        sm1 = cm.ScalarMappable(cmap=cm.get_cmap('winter'), norm=LogNorm(vmin=1, vmax=num_iters))
+        sm1 = cm.ScalarMappable(cmap=cm.get_cmap('winter'), norm=LogNorm(vmin=1, vmax=total_iters_for_scale))
         triangle_colors = sm1.to_rgba(np.arange(1, num_iters + 1, 1))
-        ticks = [2 ** exp for exp in np.arange(0, math.ceil(np.log2(num_iters)), 1)]
+        max_tick_exp = int(math.floor(np.log2(total_iters_for_scale)))
+        ticks = [2 ** exp for exp in range(max_tick_exp + 1)]
+        if ticks[-1] != total_iters_for_scale and total_iters_for_scale > ticks[-1]:
+            ticks.append(total_iters_for_scale)
         cbar1 = fig.colorbar(sm1, ax=ax, aspect=14)
         cbar1.minorticks_off()
         cbar1.set_ticks(ticks)
@@ -2156,7 +2316,6 @@ class BLPlotter:
 
         # Marker color mapping (temperature deviation-based)
         sm2 = cm.ScalarMappable(cmap=cm.get_cmap('autumn'), norm=plt.Normalize(tdev_range[0], tdev_range[1]))
-        marker_colors = sm2.to_rgba(np.arange(tdev_range[0], tdev_range[1], 1))
         cbar2 = fig.colorbar(sm2, ax=ax, aspect=14)
         cbar2.set_label(
             f"Objective Function Value", # ({chr(176)}K)",
@@ -2176,7 +2335,7 @@ class BLPlotter:
                 path_i = self._bl.nmpath[:, [1, 3, -1], i]
 
             triangle = path_i[:, :-1]  # Extract triangle vertices
-            t_devs = path_i[:, -1:]  # Extract temperature deviations
+            t_devs = path_i[:, -1]  # Extract objective values
 
             # Plot triangles connecting vertices
             coordinates = [triangle[j, :] for j in range(triangle.shape[0])]
@@ -2195,8 +2354,7 @@ class BLPlotter:
                 if list(point) in plotted_points:
                     continue
                 if t_dev != float('inf'):
-                    c_ind = int(t_dev - tdev_range[0])
-                    marker_color = marker_colors[c_ind]
+                    marker_color = sm2.to_rgba(float(t_dev))
                     ax.scatter(
                         point[0],
                         point[1],
@@ -2226,11 +2384,24 @@ class BLPlotter:
             ax.legend(by_label.values(), by_label.keys())
 
         # Adjust axis limits for better scaling
-        ax.autoscale()
-        ly, uy = ax.get_ylim()
-        ax.set_ylim((uy + ly) / 2 - (uy - ly) / 2 * 1.1, (uy + ly) / 2 + (uy - ly) / 2 * 1.1)
-        lx, ux = ax.get_xlim()
-        ax.set_xlim((ux + lx) / 2 - (ux - lx) / 2 * 1.1, (ux + lx) / 2 + (ux - lx) / 2 * 1.1)
+        x_axis_range = kwargs.get('x_axis_range', None)
+        y_axis_range = kwargs.get('y_axis_range', None)
+        if x_axis_range is not None:
+            if not (isinstance(x_axis_range, (list, tuple)) and len(x_axis_range) == 2):
+                raise ValueError("kwarg 'x_axis_range' must be a 2-item tuple/list: (xmin, xmax)")
+            ax.set_xlim(float(x_axis_range[0]), float(x_axis_range[1]))
+        if y_axis_range is not None:
+            if not (isinstance(y_axis_range, (list, tuple)) and len(y_axis_range) == 2):
+                raise ValueError("kwarg 'y_axis_range' must be a 2-item tuple/list: (ymin, ymax)")
+            ax.set_ylim(float(y_axis_range[0]), float(y_axis_range[1]))
+        if x_axis_range is None or y_axis_range is None:
+            ax.autoscale()
+            if y_axis_range is None:
+                ly, uy = ax.get_ylim()
+                ax.set_ylim((uy + ly) / 2 - (uy - ly) / 2 * 1.1, (uy + ly) / 2 + (uy - ly) / 2 * 1.1)
+            if x_axis_range is None:
+                lx, ux = ax.get_xlim()
+                ax.set_xlim((ux + lx) / 2 - (ux - lx) / 2 * 1.1, (ux + lx) / 2 + (ux - lx) / 2 * 1.1)
         if plot_a_params: # L0_a, L1_a parameters
             axes_labels = ['L0_a', 'L1_a'] 
         elif self._bl._param_format == 'comb-exp': # L0_b, L1_a parameters
