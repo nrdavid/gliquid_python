@@ -220,7 +220,7 @@ def validate_binary_mixing_parameters(input) -> list[int | float]:
     """
     if isinstance(input, (list, tuple)):
         if len(input) == 0:
-            return _DEFAULT_PARAMS
+            return list(_DEFAULT_PARAMS)  # Return a copy; _DEFAULT_PARAMS is mutable
         if all(isinstance(item, numbers.Number) and not isinstance(item, bool) for item in input) and len(input) == 4:
             return [float(i) for i in input]  # Creates a copy of the input parameter list
     raise ValueError("Parameters must be input as a list or tuple in the following format: [L0_a, L0_b, L1_a, L1_b]")
