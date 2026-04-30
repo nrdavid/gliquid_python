@@ -20,6 +20,7 @@ from gliquid.fisher_information import (
     _interpolate_liquidus_at_x,
     _eval_liquidus_at_params,
     _free_param_indices,
+    build_nm_path_parameter_precision,
     compute_jacobian,
     compute_fim,
     find_optimal_next_measurement,
@@ -237,6 +238,38 @@ class TestFindOptimalNextMeasurement:
         n_free = len(bl_cu_mg_fitted.guess_symbols)
         assert opt.jacobian_at_candidates.shape == (6, n_free)
 
+    def test_all_out_of_range_candidates_use_boundary_fallback(self, monkeypatch):
+        fim_result = FIMResult(
+            fim=np.eye(2),
+            fim_inv=np.eye(2),
+            jacobian=np.zeros((2, 2)),
+            x_used=np.array([0.2, 0.8]),
+            x_rejected=np.array([]),
+            eigenvalues=np.array([1.0, 1.0]),
+            eigenvectors=np.eye(2),
+            condition_number=1.0,
+            det_fim=1.0,
+            param_variances=np.array([1.0, 1.0]),
+            param_names=['L0_a', 'L0_b'],
+            is_singular=False,
+            sigma=1.0,
+        )
+
+        def fake_compute_jacobian(bl, x_compositions, free_param_indices=None, h_rel=1e-3):
+            x_compositions = np.asarray(x_compositions, dtype=float)
+            return np.zeros((len(x_compositions), 2)), np.zeros(len(x_compositions), dtype=bool)
+
+        monkeypatch.setattr('gliquid.fisher_information.compute_jacobian', fake_compute_jacobian)
+
+        opt = find_optimal_next_measurement(
+            fim_result,
+            bl=object(),
+            candidate_x=np.array([0.05, 0.18, 0.50, 0.90]),
+        )
+
+        assert opt.n_out_of_range == 4
+        assert opt.ranked_x[0] == pytest.approx(0.18)
+
 
 # ---------------------------------------------------------------------------
 # compute_nm_path_sensitivity
@@ -278,6 +311,43 @@ class TestNMPathSensitivity:
         bl.nmpath = None
         with pytest.raises(ValueError, match="nmpath"):
             compute_nm_path_sensitivity(bl)
+
+
+class TestNMPathParameterPrecision:
+    def test_returns_vector_with_free_param_length(self, bl_cu_mg_fitted):
+        if bl_cu_mg_fitted.nmpath is None:
+            pytest.skip("nmpath not populated")
+        precision = build_nm_path_parameter_precision(bl_cu_mg_fitted)
+        assert precision is not None
+        assert precision.shape == (len(bl_cu_mg_fitted.guess_symbols),)
+
+    def test_precision_is_nonnegative(self, bl_cu_mg_fitted):
+        if bl_cu_mg_fitted.nmpath is None:
+            pytest.skip("nmpath not populated")
+        precision = build_nm_path_parameter_precision(bl_cu_mg_fitted)
+        assert precision is not None
+        assert np.all(precision >= 0.0)
+
+    def test_compute_fim_accepts_parameter_prior_precision(self, bl_cu_mg_fitted):
+        n_free = len(bl_cu_mg_fitted.guess_symbols)
+        prior_precision = np.linspace(1.0, 2.0, n_free)
+        result = compute_fim(
+            bl_cu_mg_fitted,
+            sigma=1.0,
+            parameter_prior_precision=prior_precision,
+            parameter_prior_strength=0.25,
+        )
+        assert isinstance(result, FIMResult)
+        assert result.fim.shape == (n_free, n_free)
+
+    def test_compute_fim_rejects_bad_prior_shape(self, bl_cu_mg_fitted):
+        with pytest.raises(ValueError, match="parameter_prior_precision"):
+            compute_fim(
+                bl_cu_mg_fitted,
+                sigma=1.0,
+                parameter_prior_precision=np.array([1.0, 2.0]),
+                parameter_prior_strength=0.25,
+            )
 
 
 # ---------------------------------------------------------------------------

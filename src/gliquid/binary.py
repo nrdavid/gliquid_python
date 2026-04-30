@@ -1454,11 +1454,11 @@ class BinaryLiquid:
                     eqn1 = sp.Eq(self.eqs['g_double_prime'].subs({xb_sym: x2, t_sym: t2}), 0)
                     eqn4 = sp.Eq(self.eqs['g_prime'].subs({xb_sym: x1, t_sym: t1}), self.eqs['g_prime'].subs({xb_sym: x3, t_sym: t3}))
 
-                    eqs.append([f'mig - {round(x2, 2)}', '2nd order', t2, eqn1])
-                    eqs.append([f'mig - {round(x1, 2)}-{round(x3, 2)}', '1st order', t1, eqn4])
+                    eqs.append([f'mig - {round(x2, 2)} 2nd', '2nd order', t2, eqn1])
+                    eqs.append([f'mig - {round(x1, 2)}-{round(x3, 2)} 1st', '1st order', t1, eqn4])
 
-                if inv['type'] == 'cmp' and auto_ignored_ranges:
-                    if '(' in inv['phases'][0]:
+                if inv['type'] == 'cmp':
+                    if '(' in inv['phases'][0] and auto_ignored_ranges:
                         if inv['comp'] < 0.5:
                             self.ignored_comp_ranges.append([0, inv['comp']])
                         elif inv['comp'] > 0.5:
@@ -1471,10 +1471,10 @@ class BinaryLiquid:
 
                     x1, t1 = nearest_phase['comp'], inv['temp']
                     eqn = sp.Eq(self.eqs['g_liquid'].subs({xb_sym: x1, t_sym: t1}), nearest_phase['enthalpy'])
-                    eqs.append(['cmp', f'{round(x1, 2)} - 0th order', t1, eqn])
+                    eqs.append([f'cmp - {round(x1, 2)} 0th', '0th order', t1, eqn])
 
-                if inv['type'] == 'per' and auto_ignored_ranges:
-                    if '(' in inv['phases'][0]:
+                if inv['type'] == 'per':
+                    if '(' in inv['phases'][0] and auto_ignored_ranges:
                         if inv['phase_comps'][0] < inv['comp']:
                             self.ignored_comp_ranges.append([0, inv['comp']])
                         elif inv['phase_comps'][0] > inv['comp']:
@@ -1496,9 +1496,9 @@ class BinaryLiquid:
                     temp_below_liq = liq_point_at_phase[1] - t1
 
                     if temp_below_liq > t_tol:
-                        eqs.append([f'per - {round(x1, 2)}', '0th order', t1, eqn1])
+                        eqs.append([f'per - {round(x1, 2)} 0th', '0th order', t1, eqn1])
                     else:
-                        eqs.append([f'per - {round(x1, 2)}', 'pseudo 0th order', t1, eqn2])
+                        eqs.append([f'per - {round(x1, 2)} 0th', 'pseudo 0th order', t1, eqn2])
 
                 if inv['type'] == 'eut':
                     if None in inv['phase_comps']:
@@ -1535,11 +1535,11 @@ class BinaryLiquid:
                     eqn3 = sp.Eq(self.eqs['g_liquid'].subs({xb_sym: x2, t_sym: t2}) + 
                                 self.eqs['g_liquid'].subs({xb_sym: x2, t_sym: t2}) * (x3 - x2), g3)
 
-                    eqs.append([f'eut - {round(x2, 2)}', '1st order', t2, eqn1])
+                    eqs.append([f'eut - {round(x2, 2)} 1st', '1st order', t2, eqn1])
                     if g1 <= g3:
-                        eqs.append([f'eut - {round(x2, 2)}', '0th order lhs', t2, eqn2])
+                        eqs.append([f'eut - {round(x2, 2)} 0th', '0th order lhs', t2, eqn2])
                     else:
-                        eqs.append([f'eut - {round(x2, 2)}', '0th order rhs', t2, eqn3])
+                        eqs.append([f'eut - {round(x2, 2)} 0th', '0th order rhs', t2, eqn3])
 
         self.update_params(kwargs.get('params_init', []))
         self.update_phase_points()
@@ -1577,15 +1577,6 @@ class BinaryLiquid:
                         init_tri = [[self.get_L0_b(), self.get_L1_a()],
                                     [self.get_L0_b()*0.8, self.get_L1_a()],
                                     [self.get_L0_b(), self.get_L1_a()*0.8]]
-                        nelder_mead_ics.append({'f': init_f, 'constrs': [eq, no1S_constr], 'init_tri': init_tri})
-                        if self._param_format == 'modcomb-exp':
-                            init_tri = [[self.init_triangle[0][0], self.get_L1_a()],
-                                        [self.init_triangle[1][0], self.get_L1_a()*0.8],
-                                        [self.init_triangle[2][0], self.get_L1_a()*0.8]]
-                        else:
-                            init_tri = [[self.get_L0_b(), self.get_L1_a()],
-                                        [self.get_L0_b()*0.8, self.get_L1_a()],
-                                        [self.get_L0_b(), self.get_L1_a()*0.8]]
                         nelder_mead_ics.append({'f': init_f, 'constrs': [eq, no1S_constr], 'init_tri': init_tri,
                                                 'use_param_penalty': kwargs.get('use_inv_param_penalty', False),
                                                 'use_tau_penalty': kwargs.get('use_tau_penalty', False),

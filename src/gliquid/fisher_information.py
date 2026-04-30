@@ -179,6 +179,41 @@ def _theta0_from_bl(bl) -> list[float]:
     return [bl._params[i] for i in _free_param_indices(bl)]
 
 
+def build_nm_path_parameter_precision(
+    bl,
+    floor: float = 1e-3,
+    power: float = 1.0,
+) -> np.ndarray | None:
+    """
+    Build a diagonal precision prior from the Nelder-Mead optimization path.
+
+    The path sensitivity is converted into a nonnegative per-parameter weight.
+    Larger sensitivity means the objective changes more strongly with that
+    parameter, so the corresponding prior precision is higher.
+    """
+    if bl.nmpath is None or bl.nmpath.ndim != 3:
+        return None
+
+    nm_sensitivity = compute_nm_path_sensitivity(bl)
+    sensitivity = np.asarray(nm_sensitivity.per_param_sensitivity, dtype=float)
+    if sensitivity.size == 0 or not np.any(np.isfinite(sensitivity)):
+        return None
+
+    sensitivity = np.clip(sensitivity, 0.0, None)
+    total = float(np.sum(sensitivity))
+    if total <= 0.0:
+        weights = np.ones_like(sensitivity) / max(len(sensitivity), 1)
+    else:
+        weights = sensitivity / total
+
+    if power != 1.0:
+        weights = np.power(weights, power)
+
+    max_weight = float(np.max(weights)) if np.any(weights > 0.0) else 1.0
+    precision = floor + weights / max(max_weight, 1e-12)
+    return precision
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -264,6 +299,8 @@ def compute_fim(
     free_param_indices: list[int] | None = None,
     h_rel: float = 1e-3,
     prior_lambda: float = 0.0,
+    parameter_prior_precision: np.ndarray | None = None,
+    parameter_prior_strength: float = 0.0,
 ) -> FIMResult:
     """
     Compute the Fisher Information Matrix at the current parameter values of bl.
@@ -291,6 +328,13 @@ def compute_fim(
         score for each candidate becomes 1 + ||j(x)||² / prior_lambda, which
         ranks compositions by Jacobian magnitude — sensible for a first
         measurement. Default 0.0 (no regularization).
+    parameter_prior_precision : np.ndarray or None
+        Optional per-parameter diagonal precision prior aligned with the free
+        parameter indices. Typically derived from the Nelder-Mead path via
+        ``build_nm_path_parameter_precision()``.
+    parameter_prior_strength : float
+        Scalar multiplier applied to ``parameter_prior_precision`` before it is
+        added to the FIM diagonal.
 
     Returns
     -------
@@ -323,6 +367,15 @@ def compute_fim(
 
     if prior_lambda > 0.0:
         fim = fim + prior_lambda * np.eye(len(indices))
+
+    if parameter_prior_precision is not None:
+        parameter_prior_precision = np.asarray(parameter_prior_precision, dtype=float)
+        if parameter_prior_precision.shape != (len(indices),):
+            raise ValueError(
+                "parameter_prior_precision must have shape (n_free_params,)"
+            )
+        if parameter_prior_strength != 0.0:
+            fim = fim + parameter_prior_strength * np.diag(parameter_prior_precision)
 
     eigenvalues, eigenvectors = np.linalg.eigh(fim)
     eigenvalues = np.clip(eigenvalues, 0.0, None)  # numerical negatives near zero → 0
@@ -390,6 +443,9 @@ def find_optimal_next_measurement(
     -------
     OptimalMeasurementResult
         ranked_x and d_optimal_scores are sorted in descending order of score.
+        If every candidate is out of range for the current liquidus evaluation,
+        the ranking falls back to a boundary-expansion heuristic so the result
+        is deterministic instead of depending on array order.
     """
     x_used = fim_result.x_used
     if candidate_x is None:
@@ -415,6 +471,17 @@ def find_optimal_next_measurement(
             scores[i] = 1.0
         else:
             scores[i] = 1.0 + float(j_row @ fim_result.fim_inv @ j_row) / fim_result.sigma**2
+
+    if len(candidate_x) > 0 and n_out_of_range == len(candidate_x):
+        # When the model cannot evaluate any candidate, prefer sampling near the
+        # current observed window edges instead of relying on arbitrary tie-breaking.
+        if len(x_used) > 0:
+            edge_dist = np.minimum(np.abs(candidate_x - float(np.min(x_used))),
+                                   np.abs(candidate_x - float(np.max(x_used))))
+        else:
+            center = float(np.mean(candidate_x))
+            edge_dist = np.abs(candidate_x - center)
+        scores = 1.0 + 1.0 / (1.0 + edge_dist)
 
     order = np.argsort(scores)[::-1]
     return OptimalMeasurementResult(
@@ -485,6 +552,7 @@ def compare_constraint_sets(
     labels: list[str],
     x_compositions: np.ndarray | None = None,
     sigma: float = 1.0,
+    free_param_indices: list[int] | None = None,
 ) -> ConstraintComparisonResult:
     """
     Compute FIMs for multiple BinaryLiquid objects (each with a different
@@ -509,6 +577,10 @@ def compare_constraint_sets(
         If None, each bl uses its own digitized_liq compositions.
     sigma : float
         Temperature measurement uncertainty (K).
+    free_param_indices : list of int or None
+        Override which parameter indices to treat as free for every FIM
+        computation. If None, each bl's own guess_symbols is used.
+        Example: [0, 2] to use L0_a and L1_a regardless of guess_symbols.
 
     Returns
     -------
@@ -517,7 +589,9 @@ def compare_constraint_sets(
     if len(bl_list) != len(labels):
         raise ValueError("bl_list and labels must have the same length.")
 
-    results = [compute_fim(bl, x_compositions, sigma) for bl in bl_list]
+    results = [compute_fim(bl, x_compositions, sigma,
+                           free_param_indices=free_param_indices)
+               for bl in bl_list]
 
     det_fim_values = np.array([r.det_fim for r in results])
     condition_numbers = np.array([r.condition_number for r in results])
