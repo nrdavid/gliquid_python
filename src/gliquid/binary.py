@@ -1001,7 +1001,188 @@ class BinaryLiquid:
             f_val = f_val * self.lupis_elliott_factor()
         return f_val
 
-    def nelder_mead(self, max_iter=64, tol=0.05, verbose=False, 
+    def log_prob(self, params: list | np.ndarray, sigma_T: float = 10.0,
+                 h_mix_prior: float | None = None, h_mix_sigma: float | None = None,
+                 **kwargs) -> float:
+        """
+        Log-probability for MCMC sampling of liquid non-ideal mixing parameters.
+
+        Combines a Gaussian log-likelihood (liquidus temperature residuals) with
+        physics-based priors. Hard priors enforce the DFT hull constraint and liquidus
+        continuity; a soft Lupis-Elliott prior penalises thermodynamically infeasible
+        parameters; an optional Gaussian prior on the enthalpy of mixing at x=0.5
+        resolves the enthalpy/liquidus degeneracy.
+
+        Args:
+            params: Parameter vector [L0_a, L0_b, L1_a, L1_b].
+            sigma_T: Temperature uncertainty (K) for the Gaussian likelihood. Default 10 K.
+            h_mix_prior: Reference enthalpy of mixing at x=0.5 (J/mol). When provided
+                together with h_mix_sigma, adds an informative Gaussian prior that
+                anchors the enthalpy and resolves the enthalpy/liquidus degeneracy.
+            h_mix_sigma: Uncertainty on h_mix_prior (J/mol).
+            **kwargs: Passed to calculate_deviation_metrics.
+
+        Returns:
+            float: log-probability, or -inf if parameters are unphysical.
+        """
+        # Broad flat prior bounds: [L0_a, L0_b, L1_a, L1_b]
+        bounds = [(-5e5, 5e5), (-200.0, 200.0), (-5e5, 5e5), (-200.0, 200.0)]
+        for p, (lo, hi) in zip(params, bounds):
+            if not (lo <= p <= hi):
+                return -np.inf
+
+        # Set parameters directly, bypassing update_phase_points
+        self._params = validate_binary_mixing_parameters(list(params))
+
+        # Hard prior: liquid at T=0K must lie above the DFT convex hull
+        if self.h0_below_ch():
+            return -np.inf
+
+        # Compute equilibrium phase points
+        try:
+            self.update_phase_points()
+        except (ValueError, TypeError):
+            return -np.inf
+
+        # Hard prior: liquidus must be topologically continuous
+        if not self.liquidus_is_continuous():
+            return -np.inf
+
+        # Gaussian log-likelihood from liquidus temperature residuals
+        _, rmse, _, _ = self.calculate_deviation_metrics(**kwargs)
+        if rmse == float('inf'):
+            return -np.inf
+        n_pts = kwargs.get('num_points', 30)
+        log_likelihood = -0.5 * n_pts * (rmse / sigma_T) ** 2
+
+        # Soft prior: Lupis-Elliott thermodynamic feasibility
+        le_factor = self.lupis_elliott_factor()
+        log_le_prior = -np.log(le_factor) if le_factor > 1.0 else 0.0
+
+        # Optional informative prior on enthalpy of mixing at x=0.5
+        log_h_prior = 0.0
+        if h_mix_prior is not None and h_mix_sigma is not None:
+            h_mix_pred = float(self.eqs['h_liq_lambdified'](
+                0.5, 0.0, self.get_L0_a(), self.get_L0_b(),
+                self.get_L1_a(), self.get_L1_b()))
+            log_h_prior = -0.5 * ((h_mix_pred - h_mix_prior) / h_mix_sigma) ** 2
+
+        return log_likelihood + log_le_prior + log_h_prior
+
+    def run_mcmc(self, n_walkers: int = 32, n_steps: int = 2000, n_burn: int = 500,
+                 sigma_T: float = 10.0, h_mix_prior: float | None = None,
+                 h_mix_sigma: float | None = None, p0: list | None = None,
+                 verbose: bool = False, **kwargs) -> dict:
+        """
+        Sample the posterior distribution over liquid non-ideal mixing parameters using MCMC.
+
+        Uses the emcee affine-invariant ensemble sampler. Call fit_parameters() first to
+        obtain a good MAP starting point, then call this method to characterise the full
+        posterior. The object is updated to reflect the MAP (maximum a posteriori) estimate.
+
+        Passing h_mix_prior resolves the enthalpy/liquidus degeneracy: multiple parameter
+        sets can reproduce the same liquidus but differ in liquid enthalpy; the prior on
+        H_mix at x=0.5 breaks this degeneracy by penalising solutions that deviate from
+        the reference value.
+
+        Args:
+            n_walkers: Number of MCMC walkers (must be >= 8). Default 32.
+            n_steps: Number of production steps per walker. Default 2000.
+            n_burn: Number of burn-in steps to discard. Default 500.
+            sigma_T: Temperature uncertainty (K) for the Gaussian likelihood. Default 10 K.
+            h_mix_prior: Reference H_mix at x=0.5 (J/mol), e.g. from Miedema model or
+                         calorimetry. Anchors the enthalpy dimension of the posterior.
+            h_mix_sigma: Uncertainty on h_mix_prior (J/mol). Required if h_mix_prior is set.
+            p0: Initial parameter vector [L0_a, L0_b, L1_a, L1_b]. Defaults to the
+                current self._params (i.e. the result of fit_parameters()).
+            verbose: Show emcee progress bar. Default False.
+            **kwargs: Passed through to log_prob / calculate_deviation_metrics.
+
+        Returns:
+            dict with keys:
+                'samples'           – (n_walkers * n_steps, 4) posterior samples
+                'log_probs'         – corresponding log-probability values
+                'map_params'        – MAP parameter estimate [L0_a, L0_b, L1_a, L1_b]
+                'param_means'       – posterior mean of each parameter
+                'param_stds'        – posterior std of each parameter
+                'mae', 'rmse', 'mape', 'rmspe' – deviation metrics at MAP estimate
+                'L0_a', 'L0_b', 'L1_a', 'L1_b' – MAP parameter values
+                'acceptance_fraction' – mean walker acceptance fraction
+                'sampler'           – emcee EnsembleSampler object (for diagnostics)
+        """
+        try:
+            import emcee
+        except ImportError:
+            raise ImportError("emcee is required for MCMC fitting. Install with: pip install emcee")
+
+        ndim = 4
+        if n_walkers < 2 * ndim:
+            raise ValueError(f"n_walkers must be >= {2 * ndim} for a {ndim}-dimensional problem.")
+
+        if p0 is None:
+            p0 = self.get_params()
+        p0 = np.array(p0, dtype=float)
+
+        if np.all(p0 == 0):
+            raise ValueError("Initial parameters are all zero. Run fit_parameters() first or provide p0.")
+
+        # Initialise walkers in a small Gaussian ball around p0.
+        # Floor ensures non-zero spread even when a parameter is near zero.
+        scales = np.maximum(np.abs(p0) * 0.05, [100.0, 0.1, 100.0, 0.1])
+        rng = np.random.default_rng()
+        initial_positions = p0 + scales * rng.standard_normal((n_walkers, ndim))
+
+        log_prob_kwargs = {
+            'sigma_T': sigma_T,
+            'h_mix_prior': h_mix_prior,
+            'h_mix_sigma': h_mix_sigma,
+            **kwargs,
+        }
+        sampler = emcee.EnsembleSampler(n_walkers, ndim, self.log_prob,
+                                         kwargs=log_prob_kwargs)
+
+        print(f"--- Beginning MCMC: {n_burn} burn-in + {n_steps} production steps, "
+              f"{n_walkers} walkers ---")
+
+        state = sampler.run_mcmc(initial_positions, n_burn, progress=verbose)
+        sampler.reset()
+        sampler.run_mcmc(state, n_steps, progress=verbose)
+
+        flat_samples = sampler.get_chain(flat=True)
+        flat_log_probs = sampler.get_log_prob(flat=True)
+
+        # Update object to MAP estimate
+        map_idx = int(np.argmax(flat_log_probs))
+        map_params = flat_samples[map_idx]
+        self._params = validate_binary_mixing_parameters(list(map_params))
+        self.update_phase_points()
+
+        # Posterior statistics over finite-probability samples
+        finite_mask = np.isfinite(flat_log_probs)
+        finite_samples = flat_samples[finite_mask]
+        param_means = np.mean(finite_samples, axis=0).tolist() if len(finite_samples) else list(map_params)
+        param_stds = np.std(finite_samples, axis=0).tolist() if len(finite_samples) else [0.0] * ndim
+
+        kwargs['ignored_ranges'] = False
+        mae, rmse, mape, rmspe = self.calculate_deviation_metrics(**kwargs)
+        acc_frac = float(np.mean(sampler.acceptance_fraction))
+
+        print(f"--- MCMC complete: acceptance fraction = {acc_frac:.3f}, MAP MAE = {mae:.2f} K ---\n")
+
+        return {
+            'samples': flat_samples,
+            'log_probs': flat_log_probs,
+            'map_params': list(map_params),
+            'param_means': param_means,
+            'param_stds': param_stds,
+            'mae': mae, 'rmse': rmse, 'mape': mape, 'rmspe': rmspe,
+            'L0_a': self.get_L0_a(), 'L0_b': self.get_L0_b(),
+            'L1_a': self.get_L1_a(), 'L1_b': self.get_L1_b(),
+            'acceptance_fraction': acc_frac,
+            'sampler': sampler,
+        }
+
+    def nelder_mead(self, max_iter=64, tol=0.05, verbose=False,
                     initial_guesses=[], **kwargs) -> tuple[float, float, np.ndarray]:
         """
         Nelder-Mead algorithm for fitting the liquid non-ideal mixing parameters.
