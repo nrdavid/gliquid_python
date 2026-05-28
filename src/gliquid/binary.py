@@ -1069,10 +1069,10 @@ class BinaryLiquid:
 
         return log_likelihood + log_le_prior + log_h_prior
 
-    def run_mcmc(self, n_walkers: int = 32, n_steps: int = 2000, n_burn: int = 500,
-                 sigma_T: float = 10.0, h_mix_prior: float | None = None,
-                 h_mix_sigma: float | None = None, p0: list | None = None,
-                 verbose: bool = False, **kwargs) -> dict:
+    def run_mcmc(self, n_walkers: int = 16, n_steps: int = 500, n_burn: int = 200,
+                 n_jobs: int = 1, sigma_T: float = 10.0,
+                 h_mix_prior: float | None = None, h_mix_sigma: float | None = None,
+                 p0: list | None = None, **kwargs) -> dict:
         """
         Sample the posterior distribution over liquid non-ideal mixing parameters using MCMC.
 
@@ -1085,31 +1085,43 @@ class BinaryLiquid:
         H_mix at x=0.5 breaks this degeneracy by penalising solutions that deviate from
         the reference value.
 
+        Performance note: each log_prob call runs a 3-D ConvexHull. The dominant cost is
+        n_walkers * (n_burn + n_steps) hull computations. Use n_jobs > 1 to parallelise
+        walker evaluations via threads (scipy's ConvexHull releases the GIL, so threads
+        give near-linear scaling with CPU count). A tqdm progress bar with ETA is always
+        shown.
+
         Args:
-            n_walkers: Number of MCMC walkers (must be >= 8). Default 32.
-            n_steps: Number of production steps per walker. Default 2000.
-            n_burn: Number of burn-in steps to discard. Default 500.
+            n_walkers: Number of MCMC walkers (must be >= 8). Default 16.
+            n_steps: Number of production steps per walker. Default 500.
+            n_burn: Number of burn-in steps to discard. Default 200.
+            n_jobs: Number of parallel worker threads. 1 = single-threaded. -1 = use
+                    os.cpu_count(). Default 1.
             sigma_T: Temperature uncertainty (K) for the Gaussian likelihood. Default 10 K.
             h_mix_prior: Reference H_mix at x=0.5 (J/mol), e.g. from Miedema model or
                          calorimetry. Anchors the enthalpy dimension of the posterior.
             h_mix_sigma: Uncertainty on h_mix_prior (J/mol). Required if h_mix_prior is set.
             p0: Initial parameter vector [L0_a, L0_b, L1_a, L1_b]. Defaults to the
                 current self._params (i.e. the result of fit_parameters()).
-            verbose: Show emcee progress bar. Default False.
             **kwargs: Passed through to log_prob / calculate_deviation_metrics.
 
         Returns:
             dict with keys:
-                'samples'           – (n_walkers * n_steps, 4) posterior samples
-                'log_probs'         – corresponding log-probability values
-                'map_params'        – MAP parameter estimate [L0_a, L0_b, L1_a, L1_b]
-                'param_means'       – posterior mean of each parameter
-                'param_stds'        – posterior std of each parameter
+                'samples'             – (n_walkers * n_steps, 4) posterior samples
+                'log_probs'           – corresponding log-probability values
+                'map_params'          – MAP parameter estimate [L0_a, L0_b, L1_a, L1_b]
+                'param_means'         – posterior mean of each parameter
+                'param_stds'          – posterior std of each parameter
                 'mae', 'rmse', 'mape', 'rmspe' – deviation metrics at MAP estimate
                 'L0_a', 'L0_b', 'L1_a', 'L1_b' – MAP parameter values
                 'acceptance_fraction' – mean walker acceptance fraction
-                'sampler'           – emcee EnsembleSampler object (for diagnostics)
+                'sampler'             – emcee EnsembleSampler object (for diagnostics)
         """
+        import copy
+        import os
+        import threading
+        import concurrent.futures
+
         try:
             import emcee
         except ImportError:
@@ -1138,15 +1150,37 @@ class BinaryLiquid:
             'h_mix_sigma': h_mix_sigma,
             **kwargs,
         }
-        sampler = emcee.EnsembleSampler(n_walkers, ndim, self.log_prob,
-                                         kwargs=log_prob_kwargs)
 
+        if n_jobs == 1:
+            log_prob_fn = lambda params: self.log_prob(params, **log_prob_kwargs)
+            pool = None
+        else:
+            # Each thread needs its own BinaryLiquid copy to avoid state races.
+            # scipy ConvexHull releases the GIL, so threads run truly in parallel.
+            n_threads = os.cpu_count() if n_jobs == -1 else n_jobs
+            thread_local = threading.local()
+
+            def _thread_log_prob(params):
+                if not hasattr(thread_local, 'bl'):
+                    thread_local.bl = copy.deepcopy(self)
+                return thread_local.bl.log_prob(params, **log_prob_kwargs)
+
+            log_prob_fn = _thread_log_prob
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_threads)
+
+        n_evals = n_walkers * (n_burn + n_steps)
         print(f"--- Beginning MCMC: {n_burn} burn-in + {n_steps} production steps, "
-              f"{n_walkers} walkers ---")
+              f"{n_walkers} walkers, {n_jobs if n_jobs != -1 else os.cpu_count()} thread(s), "
+              f"~{n_evals:,} log_prob evaluations ---")
 
-        state = sampler.run_mcmc(initial_positions, n_burn, progress=verbose)
+        sampler = emcee.EnsembleSampler(n_walkers, ndim, log_prob_fn, pool=pool)
+
+        state = sampler.run_mcmc(initial_positions, n_burn, progress=True)
         sampler.reset()
-        sampler.run_mcmc(state, n_steps, progress=verbose)
+        sampler.run_mcmc(state, n_steps, progress=True)
+
+        if pool is not None:
+            pool.shutdown(wait=False)
 
         flat_samples = sampler.get_chain(flat=True)
         flat_log_probs = sampler.get_log_prob(flat=True)
