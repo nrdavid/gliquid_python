@@ -56,6 +56,7 @@ test = [
 notebook = [
     "jupyter>=1.1.1",
     "ipykernel>=6.0",
+    "corner>=2.2.0",
 ]
 
 [project.urls]
