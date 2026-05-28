@@ -1175,9 +1175,31 @@ class BinaryLiquid:
 
         sampler = emcee.EnsembleSampler(n_walkers, ndim, log_prob_fn, pool=pool)
 
-        state = sampler.run_mcmc(initial_positions, n_burn, progress=True)
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            _has_tqdm = True
+        except ImportError:
+            _has_tqdm = False
+
+        def _run_phase(initial_state, n, desc):
+            if _has_tqdm:
+                with _tqdm(total=n, desc=desc, unit="step") as pbar:
+                    final_state = None
+                    for final_state in sampler.sample(initial_state, iterations=n, progress=False):
+                        pbar.update(1)
+                return final_state
+            else:
+                report_every = max(1, n // 10)
+                final_state = None
+                for i, final_state in enumerate(sampler.sample(initial_state, iterations=n, progress=False)):
+                    step = i + 1
+                    if step % report_every == 0 or step == n:
+                        print(f"  {desc}: {step}/{n} steps ({100 * step // n}%)", flush=True)
+                return final_state
+
+        state = _run_phase(initial_positions, n_burn, "Burn-in ")
         sampler.reset()
-        sampler.run_mcmc(state, n_steps, progress=True)
+        _run_phase(state, n_steps, "Sampling")
 
         if pool is not None:
             pool.shutdown(wait=False)
